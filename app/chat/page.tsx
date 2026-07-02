@@ -1,9 +1,7 @@
-
-
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
-import { useUser, useClerk } from "@clerk/nextjs";
+import { useState, useEffect, useRef } from "react";
 import { createClient } from "@/lib/supabase";
+import { getAnonId } from "@/lib/anonymousId";
 import {
   Plus, MessageSquare, Heart, Send,
   LogOut, Activity, Thermometer, Wind,
@@ -27,7 +25,7 @@ interface Chat {
 }
 
 // ─── Constants ────────────────────────────────────────────────
-const API_BASE_URL = "https://jaoooooo9-firstclinic-ai-triage-engine.hf.space";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL;
 
 const defaultVitals = {
   Patient_ID: "Guest",
@@ -46,9 +44,10 @@ const getTimestamp = () =>
 
 // ─── Component ────────────────────────────────────────────────
 export default function ChatPage() {
-  const { user } = useUser();
-  const { signOut } = useClerk();
   const supabase = createClient();
+
+  // Anonymous ID
+  const [anonId, setAnonId] = useState<string>("");
 
   // Chat state
   const [chats, setChats] = useState<Chat[]>([]);
@@ -56,7 +55,6 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [isLoadingChats, setIsLoadingChats] = useState(true);
 
   // Vitals state
   const [showVitalsPanel, setShowVitalsPanel] = useState(false);
@@ -71,17 +69,16 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const userName =
-    user?.username || user?.firstName || "there";
+  const userName = "there";
 
   // ─── Effects ────────────────────────────────────────────────
   useEffect(() => {
-    if (user) {
-      loadChats();
-      const timer = setTimeout(() => setVitalsBlinking(false), 12000);
-      return () => clearTimeout(timer);
-    }
-  }, [user]);
+    const id = getAnonId();
+    setAnonId(id);
+    loadChats(id);
+    const timer = setTimeout(() => setVitalsBlinking(false), 12000);
+    return () => clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -98,7 +95,6 @@ export default function ChatPage() {
     };
   }, []);
 
-  // Auto resize textarea
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
@@ -108,16 +104,13 @@ export default function ChatPage() {
   }, [input]);
 
   // ─── Data functions ─────────────────────────────────────────
-  const loadChats = async () => {
-    if (!user) return;
-    setIsLoadingChats(true);
+  const loadChats = async (id: string) => {
     const { data } = await supabase
       .from("chats")
       .select("*")
-      .eq("clerk_id", user.id)
+      .eq("anon_id", id)
       .order("created_at", { ascending: false });
     if (data) setChats(data);
-    setIsLoadingChats(false);
   };
 
   const loadMessages = async (chatId: string) => {
@@ -143,11 +136,11 @@ export default function ChatPage() {
   const createNewChat = async (
     type: "general" | "signs" = "general"
   ): Promise<string | null> => {
-    if (!user) return null;
+    if (!anonId) return null;
     const { data } = await supabase
       .from("chats")
       .insert({
-        clerk_id: user.id,
+        anon_id: anonId,
         title: type === "signs" ? "Vital Signs Analysis" : "New Conversation",
         type,
       })
@@ -188,6 +181,17 @@ export default function ChatPage() {
     setChats((prev) =>
       prev.map((c) => (c.id === chatId ? { ...c, title } : c))
     );
+  };
+
+  const clearAllHistory = () => {
+    if (confirm("Clear all chat history? This cannot be undone.")) {
+      supabase.from("chats").delete().eq("anon_id", anonId).then(() => {
+        setChats([]);
+        setCurrentChatId(null);
+        setMessages([]);
+        setVitalsActive(false);
+      });
+    }
   };
 
   // ─── Send message ────────────────────────────────────────────
@@ -237,7 +241,6 @@ export default function ChatPage() {
       setVitalsActive(true);
     }
 
-    // Save user message and update title
     await saveMessage(chatId, "user", userText);
     if (messages.length === 0) {
       const title =
@@ -264,16 +267,45 @@ export default function ChatPage() {
 
       if (!response.ok) throw new Error(`Server error: ${response.status}`);
 
-      const data = await response.json();
-      const botMsg: Message = {
-        role: "assistant",
-        content: data.reply,
-        timestamp: getTimestamp(),
-        flagged: data.flagged,
-      };
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let fullText = "";
 
-      setMessages((prev) => [...prev, botMsg]);
-      await saveMessage(chatId, "assistant", data.reply);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "", timestamp: getTimestamp() },
+      ]);
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split("\n");
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              const text = line.slice(6);
+              if (text === "[DONE]") break;
+              const restored = text.replace(/\\n/g, "\n");
+              fullText += restored;
+
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  role: "assistant",
+                  content: fullText,
+                  timestamp: getTimestamp(),
+                };
+                return updated;
+              });
+            }
+          }
+        }
+      }
+
+      await saveMessage(chatId, "assistant", fullText);
     } catch (error: any) {
       let errorText = "I could not reach the server. Please try again.";
       if (error?.message?.includes("500"))
@@ -306,14 +338,21 @@ export default function ChatPage() {
       >
         {/* Logo */}
         <div className="flex items-center gap-2.5 px-4 py-4 border-b border-[#e5e4de]">
-          <Stethoscope size={56} className="text-teal-500" />
-          <span className="font-semibold text-gray-800 text-sm">FirstClinic AI</span>
+          <Stethoscope size={20} className="text-teal-500" />
+          <span className="font-semibold text-gray-800 text-sm">
+            FirstClinic AI
+          </span>
         </div>
 
         {/* New Chat */}
         <div className="p-3 border-b border-[#e5e4de]">
           <button
-            onClick={() => createNewChat("general")}
+            onClick={() => {
+              setCurrentChatId(null);
+              setMessages([]);
+              setVitalsActive(false);
+              setVitals(defaultVitals);
+            }}
             className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-600 hover:bg-[#e5e4de] transition"
           >
             <Plus size={15} />
@@ -410,25 +449,15 @@ export default function ChatPage() {
           </div>
         </div>
 
-        {/* User profile */}
+        {/* Clear history */}
         <div className="p-3 border-t border-[#e5e4de]">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-full bg-teal-500 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
-                {userName.charAt(0).toUpperCase()}
-              </div>
-              <span className="text-sm text-gray-700 truncate max-w-[110px]">
-                {userName}
-              </span>
-            </div>
-            <button
-              onClick={() => signOut()}
-              title="Sign out"
-              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-[#e5e4de] rounded-md transition"
-            >
-              <LogOut size={14} />
-            </button>
-          </div>
+          <button
+            onClick={clearAllHistory}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-gray-400 hover:text-red-400 hover:bg-[#e5e4de] transition"
+          >
+            <LogOut size={13} />
+            Clear all history
+          </button>
         </div>
       </aside>
 
@@ -468,15 +497,15 @@ export default function ChatPage() {
         <div className="flex-1 overflow-y-auto">
           {messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center px-4">
-              <Stethoscope size={56} className="text-teal-500" />
+              <Stethoscope size={48} className="text-teal-400 mb-4" />
               <h2 className="text-2xl font-semibold text-gray-800 mb-2">
-                Hello, {userName}
+                How can I help you?
               </h2>
               <p className="text-gray-500 text-sm max-w-md leading-relaxed">
                 I am FirstClinic AI, your personal health assistant. Ask me any
                 health question, or tap{" "}
-                <span className="text-teal-600 font-medium">Add Vitals</span> for
-                a personalised risk assessment.
+                <span className="text-teal-600 font-medium">Add Vitals</span>{" "}
+                for a personalised risk assessment.
               </p>
             </div>
           ) : (
@@ -490,7 +519,7 @@ export default function ChatPage() {
                 >
                   {msg.role === "assistant" && (
                     <div className="flex items-center gap-1.5 mb-2">
-                      <Stethoscope size={56} className="text-teal-500" />
+                      <Stethoscope size={14} className="text-teal-500" />
                       <span className="text-xs font-medium text-gray-500">
                         FirstClinic AI
                       </span>
@@ -525,7 +554,7 @@ export default function ChatPage() {
               {isLoading && (
                 <div className="flex flex-col items-start">
                   <div className="flex items-center gap-1.5 mb-2">
-                    <Stethoscope size={56} className="text-teal-500" />
+                    <Stethoscope size={14} className="text-teal-500" />
                     <span className="text-xs font-medium text-gray-500">
                       FirstClinic AI
                     </span>
@@ -549,7 +578,10 @@ export default function ChatPage() {
               You are offline — messages cannot be sent
             </p>
           )}
-          <form onSubmit={(e) => sendMessage(e, false)} className="max-w-3xl mx-auto">
+          <form
+            onSubmit={(e) => sendMessage(e, false)}
+            className="max-w-3xl mx-auto"
+          >
             <div className="flex items-end gap-3 border border-gray-200 rounded-2xl px-4 py-3 bg-white shadow-sm focus-within:border-gray-300 focus-within:shadow-md transition">
               <textarea
                 ref={textareaRef}
@@ -558,14 +590,12 @@ export default function ChatPage() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    sendMessage();
+                    if (input.trim() && !isLoading) {
+                      sendMessage(undefined, false);
+                    }
                   }
                 }}
-                placeholder={
-                  vitalsActive
-                    ? `Ask about your results, ${userName}...`
-                    : `Ask a health question, ${userName}...`
-                }
+                placeholder="Ask a health question..."
                 disabled={isLoading}
                 rows={1}
                 className="flex-1 resize-none outline-none text-sm text-gray-800 placeholder-gray-400 bg-transparent max-h-40"
@@ -585,18 +615,14 @@ export default function ChatPage() {
         </div>
       </div>
 
-      {/* ── VITALS PANEL (slides in from right) ── */}
+      {/* ── VITALS PANEL ── */}
       {showVitalsPanel && (
         <div className="fixed inset-0 z-50 flex">
-          {/* Backdrop */}
           <div
             className="flex-1 bg-black/10"
             onClick={() => setShowVitalsPanel(false)}
           />
-
-          {/* Panel */}
           <div className="w-96 bg-white shadow-2xl flex flex-col border-l border-gray-200">
-            {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
               <div>
                 <h2 className="font-semibold text-gray-800">Vital Signs</h2>
@@ -612,39 +638,13 @@ export default function ChatPage() {
               </button>
             </div>
 
-            {/* Fields */}
             <div className="flex-1 overflow-y-auto p-5 space-y-4">
               {[
-                {
-                  icon: <Activity size={13} />,
-                  label: "Systolic BP (mmHg)",
-                  name: "Systolic_BP",
-                  placeholder: "e.g. 120",
-                },
-                {
-                  icon: <HeartPulse size={13} />,
-                  label: "Heart Rate (bpm)",
-                  name: "Heart_Rate",
-                  placeholder: "e.g. 80",
-                },
-                {
-                  icon: <Thermometer size={13} />,
-                  label: "Temperature (°C)",
-                  name: "Temperature",
-                  placeholder: "e.g. 36.5",
-                },
-                {
-                  icon: <Wind size={13} />,
-                  label: "Oxygen Saturation (%)",
-                  name: "Oxygen_Saturation",
-                  placeholder: "e.g. 98",
-                },
-                {
-                  icon: <Wind size={13} />,
-                  label: "Respiratory Rate",
-                  name: "Respiratory_Rate",
-                  placeholder: "e.g. 18",
-                },
+                { icon: <Activity size={13} />, label: "Systolic BP (mmHg)", name: "Systolic_BP", placeholder: "e.g. 120" },
+                { icon: <HeartPulse size={13} />, label: "Heart Rate (bpm)", name: "Heart_Rate", placeholder: "e.g. 80" },
+                { icon: <Thermometer size={13} />, label: "Temperature (°C)", name: "Temperature", placeholder: "e.g. 36.5" },
+                { icon: <Wind size={13} />, label: "Oxygen Saturation (%)", name: "Oxygen_Saturation", placeholder: "e.g. 98" },
+                { icon: <Wind size={13} />, label: "Respiratory Rate", name: "Respiratory_Rate", placeholder: "e.g. 18" },
               ].map((field) => (
                 <div key={field.name}>
                   <label className="flex items-center gap-1.5 text-xs font-medium text-gray-500 mb-1.5">
@@ -707,7 +707,6 @@ export default function ChatPage() {
               </div>
             </div>
 
-            {/* Actions */}
             <div className="p-5 border-t border-gray-100 flex gap-3">
               <button
                 onClick={() => setShowVitalsPanel(false)}
